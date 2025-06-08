@@ -7,6 +7,8 @@ using System.Diagnostics;
 using Silk.NET.OpenCL;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace GpuImageProcessor
 {
@@ -22,26 +24,45 @@ namespace GpuImageProcessor
         private Label lblScore = new Label();
         private Label lblRank = new Label();
         private GroupBox gbPerformance = new GroupBox();
+        // New control for GPU selection
+        private ComboBox gpuComboBox = new ComboBox();
+        private Label lblGpuSelector = new Label();
 
-        // Logic
+
+        // Project Logic Variables
         private Bitmap? _currentBitmap;
         private long _cpuTime = -1;
         private long _gpuTime = -1;
 
-        // OpenCL
+        // OpenCL Variables
         private CL? _cl;
         private nint _context;
         private nint _device;
         private nint _queue;
-        private bool _openClInitialized = false;
+        private bool _gpuIsInitialized = false;
+
+        // A small helper class to hold device info and display it nicely in the ComboBox
+        private class GpuCandidate
+        {
+            public nint DeviceHandle { get; set; }
+            public string Name { get; set; } = "";
+            public ulong Memory { get; set; }
+
+            // This controls how the object appears in the ComboBox list
+            public override string ToString()
+            {
+                return $"{Name} ({Memory / 1024 / 1024} MB)";
+            }
+        }
 
         public Form1()
         {
             InitializeComponentProgrammatically();
-            InitializeOpenCL();
+            // This method will now ONLY populate the ComboBox
+            PopulateGpuSelector();
         }
 
-        #region UI Initialization
+        #region UI and Initialization Logic
 
         private void InitializeComponentProgrammatically()
         {
@@ -55,28 +76,40 @@ namespace GpuImageProcessor
             pictureBox.BorderStyle = BorderStyle.Fixed3D;
             pictureBox.SizeMode = PictureBoxSizeMode.Zoom;
 
+            // --- New Controls for GPU Selection ---
+            lblGpuSelector.Text = "Select GPU for Processing:";
+            lblGpuSelector.Location = new Point(530, 15);
+            lblGpuSelector.Size = new Size(240, 15);
+
+            gpuComboBox.Location = new Point(530, 35);
+            gpuComboBox.Size = new Size(240, 25);
+            gpuComboBox.DropDownStyle = ComboBoxStyle.DropDownList; // Prevents user from typing
+            gpuComboBox.SelectedIndexChanged += new EventHandler(gpuComboBox_SelectedIndexChanged);
+
+            // --- Existing Controls, locations adjusted ---
             btnLoadImage.Text = "1. Load Image";
-            btnLoadImage.Location = new Point(530, 25);
+            btnLoadImage.Location = new Point(530, 70);
             btnLoadImage.Size = new Size(240, 40);
 
-            btnGrayscaleCpu.Text = "2. Grayscale on CPU";
-            btnGrayscaleCpu.Location = new Point(530, 80);
+            btnGrayscaleCpu.Text = "2. Grayscale on CPU (Optimized)";
+            btnGrayscaleCpu.Location = new Point(530, 120);
             btnGrayscaleCpu.Size = new Size(240, 40);
 
             btnGrayscaleGpu.Text = "3. Grayscale on GPU";
-            btnGrayscaleGpu.Location = new Point(530, 135);
+            btnGrayscaleGpu.Location = new Point(530, 170);
             btnGrayscaleGpu.Size = new Size(240, 40);
+            btnGrayscaleGpu.Enabled = false; // Disabled until a GPU is chosen
 
             lblCpuTime.Text = "CPU Time:";
-            lblCpuTime.Location = new Point(530, 190);
+            lblCpuTime.Location = new Point(530, 225);
             lblCpuTime.Size = new Size(240, 20);
 
             lblGpuTime.Text = "GPU Time:";
-            lblGpuTime.Location = new Point(530, 215);
+            lblGpuTime.Location = new Point(530, 250);
             lblGpuTime.Size = new Size(240, 20);
 
             gbPerformance.Text = "Performance Score";
-            gbPerformance.Location = new Point(530, 260);
+            gbPerformance.Location = new Point(530, 285);
             gbPerformance.Size = new Size(240, 120);
 
             lblScore.Text = "Score: ---";
@@ -91,6 +124,8 @@ namespace GpuImageProcessor
             lblRank.ForeColor = Color.Blue;
 
             this.Controls.Add(pictureBox);
+            this.Controls.Add(lblGpuSelector);
+            this.Controls.Add(gpuComboBox);
             this.Controls.Add(btnLoadImage);
             this.Controls.Add(btnGrayscaleCpu);
             this.Controls.Add(btnGrayscaleGpu);
@@ -100,242 +135,245 @@ namespace GpuImageProcessor
             gbPerformance.Controls.Add(lblScore);
             gbPerformance.Controls.Add(lblRank);
 
-            btnLoadImage.Click += btnLoadImage_Click;
-            btnGrayscaleCpu.Click += btnGrayscaleCpu_Click;
-            btnGrayscaleGpu.Click += btnGrayscaleGpu_Click;
+            btnLoadImage.Click += new EventHandler(btnLoadImage_Click);
+            btnGrayscaleCpu.Click += new EventHandler(btnGrayscaleCpu_Click);
+            btnGrayscaleGpu.Click += new EventHandler(btnGrayscaleGpu_Click);
         }
 
-        #endregion
-
-        #region OpenCL Initialization
-
-        private void InitializeOpenCL()
+        private void PopulateGpuSelector()
         {
             try
             {
                 _cl = CL.GetApi();
             }
-            catch
+            catch (Exception)
             {
-                MessageBox.Show("Failed to load OpenCL. Ensure Silk.NET.OpenCL is installed and your drivers are up to date.");
-                btnGrayscaleGpu.Enabled = false;
+                MessageBox.Show("Could not initialize OpenCL. The necessary libraries may be missing.");
                 return;
             }
+
+            var gpuCandidates = new List<GpuCandidate>();
 
             unsafe
             {
                 uint numPlatforms;
                 _cl.GetPlatformIDs(0, null, &numPlatforms);
-                if (numPlatforms == 0)
-                {
-                    MessageBox.Show("No OpenCL platforms found.");
-                    btnGrayscaleGpu.Enabled = false;
-                    return;
-                }
+                if (numPlatforms == 0) return;
 
                 var platforms = new nint[numPlatforms];
-                fixed (nint* ptr = platforms)
-                    _cl.GetPlatformIDs(numPlatforms, ptr, null);
+                fixed (nint* platformsPtr = platforms)
+                {
+                    _cl.GetPlatformIDs(numPlatforms, platformsPtr, null);
+                }
 
-                nint amdPlatform = 0;
-                // 1) Find AMD platform by matching Vendor string
                 foreach (var p in platforms)
                 {
-                    // Read vendor
-                    var vendBuf = new byte[256];
-                    fixed (byte* vendPtr = vendBuf)
-                        _cl.GetPlatformInfo(p, PlatformInfo.Vendor, (nuint)vendBuf.Length, vendPtr, null);
-                    string vendName = Encoding.UTF8.GetString(vendBuf).TrimEnd('\0');
-
-                    if (vendName.Contains("Advanced Micro Devices"))
+                    uint numDevices;
+                    if (_cl.GetDeviceIDs(p, DeviceType.Gpu, 0, null, &numDevices) != 0 || numDevices == 0)
                     {
-                        amdPlatform = p;
-                        break;
+                        continue;
+                    }
+
+                    var devices = new nint[numDevices];
+                    fixed (nint* devicesPtr = devices)
+                    {
+                        _cl.GetDeviceIDs(p, DeviceType.Gpu, numDevices, devicesPtr, null);
+                    }
+
+                    foreach (var d in devices)
+                    {
+                        var deviceNameBuffer = new byte[256];
+                        fixed (byte* namePtr = deviceNameBuffer)
+                        {
+                            _cl.GetDeviceInfo(d, DeviceInfo.Name, (nuint)deviceNameBuffer.Length, namePtr, null);
+                        }
+                        string deviceName = Encoding.UTF8.GetString(deviceNameBuffer).TrimEnd('\0');
+
+                        ulong memSize;
+                        _cl.GetDeviceInfo(d, DeviceInfo.GlobalMemSize, (nuint)sizeof(ulong), &memSize, null);
+
+                        gpuCandidates.Add(new GpuCandidate { DeviceHandle = d, Name = deviceName, Memory = memSize });
                     }
                 }
+            }
 
-                if (amdPlatform == 0)
+            if (gpuCandidates.Any())
+            {
+                gpuComboBox.Items.AddRange(gpuCandidates.ToArray());
+                gpuComboBox.SelectedIndex = 0; // Select the first one by default
+            }
+        }
+
+        private void gpuComboBox_SelectedIndexChanged(object? sender, EventArgs e)
+        {
+            // This event fires when the user selects a GPU from the dropdown
+            if (gpuComboBox.SelectedItem is GpuCandidate selectedGpu)
+            {
+                unsafe
                 {
-                    MessageBox.Show("AMD OpenCL platform not found.");
-                    btnGrayscaleGpu.Enabled = false;
-                    return;
+                    _device = selectedGpu.DeviceHandle;
+                    nint* deviceList = stackalloc nint[1];
+                    deviceList[0] = _device;
+
+                    // Clean up old context if it exists
+                    if (_context != 0) _cl?.ReleaseContext(_context);
+                    if (_queue != 0) _cl?.ReleaseCommandQueue(_queue);
+
+                    _context = _cl.CreateContext(null, 1, deviceList, null!, null, out _);
+                    _queue = _cl.CreateCommandQueue(_context, _device, (CommandQueueProperties)0, out _);
+                    _gpuIsInitialized = true;
+                    btnGrayscaleGpu.Enabled = true; // Enable the GPU button
                 }
-
-                // 2) Get the first GPU device on that platform
-                uint numDevices;
-                _cl.GetDeviceIDs(amdPlatform, DeviceType.Gpu, 0, null, &numDevices);
-                if (numDevices == 0)
-                {
-                    MessageBox.Show("No GPU devices found on AMD platform.");
-                    btnGrayscaleGpu.Enabled = false;
-                    return;
-                }
-
-                var devices = new nint[numDevices];
-                fixed (nint* devPtr = devices)
-                    _cl.GetDeviceIDs(amdPlatform, DeviceType.Gpu, numDevices, devPtr, null);
-
-                _device = devices[0];
-
-                // 3) Create context + queue
-                nint* deviceList = stackalloc nint[1];
-                deviceList[0] = _device;
-
-                _context = _cl.CreateContext(null, 1, deviceList, null!, null, out _);
-                _queue = _cl.CreateCommandQueue(_context, _device, (CommandQueueProperties)0, out _);
-                _openClInitialized = true;
             }
         }
 
         #endregion
 
-        #region Button Handlers
+        #region Button Click Handlers and Logic
 
         private void btnLoadImage_Click(object? sender, EventArgs e)
         {
-            using var ofd = new OpenFileDialog
+            using (var ofd = new OpenFileDialog())
             {
-                Filter = "Image Files|*.jpg;*.jpeg;*.png;*.bmp"
-            };
-            if (ofd.ShowDialog() != DialogResult.OK) return;
-
-            _currentBitmap = new Bitmap(ofd.FileName);
-            pictureBox.Image = _currentBitmap;
-            lblCpuTime.Text = "CPU Time:";
-            lblGpuTime.Text = "GPU Time:";
-            lblScore.Text = "Score: ---";
-            lblRank.Text = "Rank: N/A";
-            _cpuTime = _gpuTime = -1;
+                ofd.Filter = "Image Files|*.jpg;*.jpeg;*.png;*.bmp";
+                if (ofd.ShowDialog() == DialogResult.OK)
+                {
+                    _currentBitmap = new Bitmap(ofd.FileName);
+                    pictureBox.Image = _currentBitmap;
+                    _cpuTime = -1;
+                    _gpuTime = -1;
+                    lblCpuTime.Text = "CPU Time:";
+                    lblGpuTime.Text = "GPU Time:";
+                    lblScore.Text = "Score: ---";
+                    lblRank.Text = "Rank: N/A";
+                }
+            }
         }
 
         private void btnGrayscaleCpu_Click(object? sender, EventArgs e)
         {
-            if (_currentBitmap == null)
-            {
-                MessageBox.Show("Please load an image first.");
-                return;
-            }
+            if (_currentBitmap == null) { MessageBox.Show("Please load an image first."); return; }
 
             var sw = Stopwatch.StartNew();
-            var bmp = new Bitmap(_currentBitmap);
-            for (int y = 0; y < bmp.Height; y++)
-                for (int x = 0; x < bmp.Width; x++)
-                {
-                    var c = bmp.GetPixel(x, y);
-                    int g = (int)(c.R * 0.2126 + c.G * 0.7152 + c.B * 0.0722);
-                    bmp.SetPixel(x, y, Color.FromArgb(c.A, g, g, g));
-                }
-            sw.Stop();
 
+            var bmp = new Bitmap(_currentBitmap);
+            var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
+            BitmapData bmpData = bmp.LockBits(rect, ImageLockMode.ReadWrite, bmp.PixelFormat);
+
+            int bytesPerPixel = Image.GetPixelFormatSize(bmp.PixelFormat) / 8;
+            int byteCount = bmpData.Stride * bmp.Height;
+            byte[] pixels = new byte[byteCount];
+            IntPtr ptrFirstPixel = bmpData.Scan0;
+
+            Marshal.Copy(ptrFirstPixel, pixels, 0, byteCount);
+
+            for (int i = 0; i < pixels.Length; i += bytesPerPixel)
+            {
+                if (bytesPerPixel >= 3)
+                {
+                    float luminance = 0.2126f * pixels[i + 2] + 0.7152f * pixels[i + 1] + 0.0722f * pixels[i + 0];
+                    byte gray = (byte)luminance;
+                    pixels[i + 0] = gray;
+                    pixels[i + 1] = gray;
+                    pixels[i + 2] = gray;
+                }
+            }
+
+            Marshal.Copy(pixels, 0, ptrFirstPixel, byteCount);
+            bmp.UnlockBits(bmpData);
+
+            sw.Stop();
             _cpuTime = sw.ElapsedMilliseconds;
-            lblCpuTime.Text = $"CPU Time: {_cpuTime} ms";
+            lblCpuTime.Text = $"CPU Time: {_cpuTime} ms (Optimized)";
             pictureBox.Image = bmp;
             UpdateScore();
         }
 
         private void btnGrayscaleGpu_Click(object? sender, EventArgs e)
         {
-            if (_currentBitmap == null)
-            {
-                MessageBox.Show("Load an image first.");
-                return;
-            }
-            if (!_openClInitialized || _cl is null)
-            {
-                MessageBox.Show("OpenCL not initialized.");
-                return;
-            }
-            if (!File.Exists("Grayscale.cl"))
-            {
-                MessageBox.Show("Grayscale.cl not found.");
-                return;
-            }
+            if (_currentBitmap == null) { MessageBox.Show("Please load an image first."); return; }
+            if (!_gpuIsInitialized || _cl is null) { MessageBox.Show("A GPU has not been initialized. Select one from the dropdown."); return; }
+            if (!File.Exists("Grayscale.cl")) { MessageBox.Show("Error: Grayscale.cl file not found!"); return; }
 
             var sw = Stopwatch.StartNew();
 
-            // copy pixels into byte[]
-            var bmpData = _currentBitmap.LockBits(
-                new Rectangle(0, 0, _currentBitmap.Width, _currentBitmap.Height),
-                ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            BitmapData bmpData = _currentBitmap.LockBits(new Rectangle(0, 0, _currentBitmap.Width, _currentBitmap.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
             int byteCount = bmpData.Stride * bmpData.Height;
-            var pixels = new byte[byteCount];
-            Marshal.Copy(bmpData.Scan0, pixels, 0, byteCount);
+            byte[] pixelData = new byte[byteCount];
+            Marshal.Copy(bmpData.Scan0, pixelData, 0, byteCount);
             _currentBitmap.UnlockBits(bmpData);
 
             unsafe
             {
-                fixed (void* p = pixels)
+                fixed (void* pixelDataPtr = pixelData)
                 {
-                    var inBuf = _cl.CreateBuffer(_context, MemFlags.ReadOnly | MemFlags.CopyHostPtr, (nuint)byteCount, p, out _);
-                    var outBuf = _cl.CreateBuffer(_context, MemFlags.WriteOnly, (nuint)byteCount, null, out _);
+                    var inputBuffer = _cl.CreateBuffer(_context, MemFlags.ReadOnly | MemFlags.CopyHostPtr, (nuint)byteCount, pixelDataPtr, out _);
+                    var outputBuffer = _cl.CreateBuffer(_context, MemFlags.WriteOnly, (nuint)byteCount, null, out _);
 
-                    string src = File.ReadAllText("Grayscale.cl");
-                    var prog = _cl.CreateProgramWithSource(_context, 1, new[] { src }, null, out _);
+                    string kernelSource = File.ReadAllText("Grayscale.cl");
+                    var program = _cl.CreateProgramWithSource(_context, 1, new[] { kernelSource }, null, out _);
 
-                    // build with empty options
-                    nint* devList = stackalloc nint[1];
-                    devList[0] = _device;
-                    int buildErr = _cl.BuildProgram(prog, 1, devList, string.Empty, default, default);
+                    nint* devicesToBuild = stackalloc nint[1];
+                    devicesToBuild[0] = _device;
 
-                    // check build log
+                    int buildError = _cl.BuildProgram(program, 1, devicesToBuild, string.Empty, default, default);
+
                     nuint logSize;
-                    _cl.GetProgramBuildInfo(prog, _device, ProgramBuildInfo.BuildLog, 0, null, &logSize);
+                    _cl.GetProgramBuildInfo(program, _device, ProgramBuildInfo.BuildLog, 0, null, &logSize);
                     if (logSize > 1)
                     {
-                        var log = new byte[logSize];
-                        fixed (byte* lp = log)
-                            _cl.GetProgramBuildInfo(prog, _device, ProgramBuildInfo.BuildLog, logSize, lp, null);
-                        MessageBox.Show($"Kernel build error:\n{Encoding.UTF8.GetString(log)}");
-                        _cl.ReleaseProgram(prog);
-                        _cl.ReleaseMemObject(inBuf);
-                        _cl.ReleaseMemObject(outBuf);
+                        var buildLog = new byte[logSize];
+                        fixed (byte* logPtr = buildLog)
+                        {
+                            _cl.GetProgramBuildInfo(program, _device, ProgramBuildInfo.BuildLog, logSize, logPtr, null);
+                        }
+                        MessageBox.Show($"OpenCL Kernel Build Error (code {buildError}):\n{Encoding.UTF8.GetString(buildLog)}");
+
+                        _cl.ReleaseProgram(program);
+                        _cl.ReleaseMemObject(inputBuffer);
+                        _cl.ReleaseMemObject(outputBuffer);
                         return;
                     }
 
-                    var kernel = _cl.CreateKernel(prog, "ToGrayscale", out _);
-                    _cl.SetKernelArg(kernel, 0, (nuint)sizeof(nint), &inBuf);
-                    _cl.SetKernelArg(kernel, 1, (nuint)sizeof(nint), &outBuf);
+                    var kernel = _cl.CreateKernel(program, "ToGrayscale", out _);
+                    _cl.SetKernelArg(kernel, 0, (nuint)sizeof(nint), &inputBuffer);
+                    _cl.SetKernelArg(kernel, 1, (nuint)sizeof(nint), &outputBuffer);
 
-                    nuint global = (nuint)(_currentBitmap.Width * _currentBitmap.Height);
-                    _cl.EnqueueNdrangeKernel(_queue, kernel, 1, null, &global, null, 0, null, null);
+                    nuint globalSize = (nuint)(_currentBitmap.Width * _currentBitmap.Height);
+                    _cl.EnqueueNdrangeKernel(_queue, kernel, 1, null, &globalSize, null, 0, null, null);
 
-                    var result = new byte[byteCount];
-                    fixed (void* rp = result)
+                    var resultData = new byte[byteCount];
+                    fixed (void* resultDataPtr = resultData)
                     {
-                        _cl.EnqueueReadBuffer(_queue, outBuf, true, 0, (nuint)byteCount, rp, 0, null, null);
+                        _cl.EnqueueReadBuffer(_queue, outputBuffer, true, 0, (nuint)byteCount, resultDataPtr, 0, null, null);
                     }
 
+                    _cl.ReleaseMemObject(inputBuffer);
+                    _cl.ReleaseMemObject(outputBuffer);
                     _cl.ReleaseKernel(kernel);
-                    _cl.ReleaseProgram(prog);
-                    _cl.ReleaseMemObject(inBuf);
-                    _cl.ReleaseMemObject(outBuf);
+                    _cl.ReleaseProgram(program);
 
                     sw.Stop();
                     _gpuTime = sw.ElapsedMilliseconds;
                     lblGpuTime.Text = $"GPU Time: {_gpuTime} ms";
 
-                    // create result bitmap
-                    var resBmp = new Bitmap(_currentBitmap.Width, _currentBitmap.Height, PixelFormat.Format32bppArgb);
-                    var resData = resBmp.LockBits(new Rectangle(0, 0, resBmp.Width, resBmp.Height),
-                                                  ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-                    Marshal.Copy(result, 0, resData.Scan0, byteCount);
-                    resBmp.UnlockBits(resData);
-
-                    pictureBox.Image = resBmp;
+                    var resultBmp = new Bitmap(_currentBitmap.Width, _currentBitmap.Height, PixelFormat.Format32bppArgb);
+                    BitmapData resultBmpData = resultBmp.LockBits(new Rectangle(0, 0, resultBmp.Width, resultBmp.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+                    Marshal.Copy(resultData, 0, resultBmpData.Scan0, byteCount);
+                    resultBmp.UnlockBits(resultBmpData);
+                    pictureBox.Image = resultBmp;
                 }
             }
-
             UpdateScore();
         }
-
-        #endregion
 
         private void UpdateScore()
         {
             if (_cpuTime < 0 || _gpuTime < 0) return;
             if (_gpuTime == 0) _gpuTime = 1;
-            double factor = (double)_cpuTime / _gpuTime;
-            double score = factor * 100;
+
+            double speedupFactor = (double)_cpuTime / _gpuTime;
+            double score = speedupFactor * 100;
             string rank;
 
             if (score >= 3000) rank = "GPU Dominance";
@@ -349,9 +387,11 @@ namespace GpuImageProcessor
             lblRank.Text = $"Rank: {rank}";
         }
 
+        #endregion
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            if (_openClInitialized && _cl is not null)
+            if (_gpuIsInitialized && _cl is not null)
             {
                 if (_queue != 0) _cl.ReleaseCommandQueue(_queue);
                 if (_context != 0) _cl.ReleaseContext(_context);
